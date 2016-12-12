@@ -1,0 +1,205 @@
+#!/usr/bin/env perl
+
+
+
+###################################################################
+# copy-assignments.pl
+# by Dan Nichols (daniel.g.nichols@gmail.com), July 2014
+# tested on WebWork 2.7
+# 
+# This script exports the assignments from all current courses to
+# .def files, then archives and copies them to the backup directory
+# Within the backup directory, they are stored as
+# <course number>/<instructor name>/course.tgz
+#
+# The idea is that if an instructor wants to reuse their
+# assignments for this class from a previous semester, the admin
+# just has to copy this instructor's tar file from the backup
+# directory and extract it in their new course folder.
+#
+# Note that if a course has more than one professor for some reason
+# (other than admin), a separate backup will be created for each
+# professor.
+#
+# Arguments: none
+#
+#
+# inspiration and some code borrowed from Gavin LaRose's wwmanage
+# (http://webwork.maa.org/wiki/WwManage)
+#
+###################################################################
+
+
+# change these to match your webwork installation
+my $wwHome = '/opt/webwork/webwork2';
+my $wwCourseDir = "/opt/webwork/courses";
+# make sure you create a backup folder
+my $wwBackupDir = "/opt/webwork/templates-backup";
+
+BEGIN {
+
+	# set environment variables to allow use of WeBWorK scripts
+	#$ENV{WEBWORK_ROOT} = $wwHome;
+	$ENV{MOD_PERL_API_VERSION} = 2;
+
+}
+
+use strict;
+#use warnings;
+
+use lib '/opt/webwork/pg/lib';
+use lib '/opt/webwork/webwork2/lib';
+
+use File::Path qw( make_path );
+use WeBWorK::PG::ImageGenerator;
+use WeBWorK::CourseEnvironment;
+use WeBWorK::DB;
+use WeBWorK::DB::Record::User;
+use WeBWorK::DB::Record::Password;
+use WeBWorK::DB::Record::PermissionLevel;
+use WeBWorK::ContentGenerator;              # get these to get set importing
+use WeBWorK::ContentGenerator::Instructor;  #   functions
+use WeBWorK::ContentGenerator::Instructor::ProblemSetList;
+use WeBWorK::Utils::CourseManagement;
+
+
+
+
+sub getProfessors {
+	my $course = shift;
+	
+	my $ce = WeBWorK::CourseEnvironment->new( { webwork_dir => $wwHome, courseName => $course } );
+	my $db = WeBWorK::DB->new( $ce->{ dbLayout } );
+
+	my @userIDList = $db->listUsers();
+	my @professors = grep{ $db->getPermissionLevel( $_->user_id() )->permission > 5 } $db->getUsers( @userIDList );
+
+	my @professorNames = grep{ $_ ne "admin" } map{ $_->user_id() } @professors;
+
+	return @professorNames;
+	
+}
+
+
+
+chdir $wwCourseDir;
+opendir my $courses, "." or die "\n\nCouldn't open $wwCourseDir\n";
+
+
+# determine which semester to backup
+my $guessSemester;
+my @t = localtime( time );
+my $year = $t[ 5 ] - 100;
+if( 5 <= $t[ 4 ] && $t[ 4 ] <= 7 )
+	{ $guessSemester = "S$year"; }
+elsif( 8 <= $t[ 4 ] && $t[ 4 ] <= 9 )
+	{ $guessSemester = "SUM$year"; }
+else
+	{ $year--; $guessSemester = "F$year"; }
+	
+print "Which semester's courses do you want to back up? Guess: $guessSemester\n";
+print "To use this semester, press return. Or you can enter a different one.: ";
+
+chomp( my $currentSemester = <STDIN> );
+$currentSemester = $guessSemester unless $currentSemester;
+
+
+
+# we expect to see courses of the form F14_MATH_235_1
+print "\n\nReading list of courses...\n";
+my @goodCourseDirs = sort grep{ -d $_ && m/MATH_/ && m/$currentSemester/ } readdir $courses;
+closedir $courses;
+
+die "No current courses found ($currentSemester)\n" if !@goodCourseDirs;
+
+foreach my $thisCourse ( @goodCourseDirs )
+{
+	$thisCourse =~ m/^$currentSemester\_MATH_(\d{3}[A-Za-z]{0,3})_.+$/ or next;
+	my $courseNumber = $1;
+	
+	print "\tBacking up $thisCourse...\n";
+	
+	# search database to find who the instructor is
+	my @professors = getProfessors( $thisCourse );
+	
+	
+	# create database object
+	my $csce = WeBWorK::CourseEnvironment->new( { webwork_dir => $wwHome, courseName => $thisCourse } );
+	my $db = WeBWorK::DB->new( $csce->{dbLayout} );
+	
+	# build a fake request object so that we can get an instructor::problemsetlist object
+	my $fr = FakeRequest->new();
+	$fr->ce( $csce );
+	$fr->db( $db );
+	my $wwInstrPSL = WeBWorK::ContentGenerator::Instructor::ProblemSetList->new($fr);
+	
+	# get list of all problem sets
+	my @sets = $db->listGlobalSets( );
+	print "\t\tFound " . scalar( @sets ) . " sets\n";
+	next if !@sets;
+	
+	# create hash of assignments and target filenames
+	my %setHash;
+	foreach ( @sets )
+	{
+		# if .def exists for this set, back it up so we can safely create a new one
+		system( "mv $thisCourse/templates/set$_.def $thisCourse/templates/set$_.def.old" ) if -f "$thisCourse/templates/set$_.def";
+		$setHash{ $_ } = $_;
+	}
+	
+	
+	#export all (?) assignments as .def files
+	print "\t\tCreating " . scalar( keys %setHash ) . " new .def files\n";
+	$wwInstrPSL->exportSetsToDef( %setHash );
+	
+	foreach my $instructorName ( @professors )
+	{
+		#archive /templates as $courseName.tgz in backup/coursenumber/instructorname/
+		my $courseBackupDir = "$wwBackupDir/$courseNumber/$instructorName";
+		make_path $courseBackupDir unless -d $courseBackupDir;
+		system( "tar -czf $courseBackupDir/$thisCourse.tgz $thisCourse/templates" );
+		print "\t\tcreated $courseBackupDir/$thisCourse.tgz\n";
+	}
+	
+}
+
+print "Done!\n";
+
+
+#-------------------------------------------------------------------------------
+# fake WeBWorK packages that we don't want to build en masse in order to 
+# get access to the importSetFromDef routine in ProblemSetList.pm
+#
+
+package FakeRequest;
+sub new {
+    my $class = shift();
+    my $authz = new FakeAuthz;
+    return( bless( { ce => , db => , authz => $authz }, $class ) );
+}
+sub ce {
+    my $self = shift();
+    $self->{ce} = shift() if ( @_ );
+    return $self->{ce};
+}
+sub db {
+    my $self = shift();
+    $self->{db} = shift() if ( @_ );
+    return $self->{db};
+}
+sub authz {
+    my $self = shift();
+    $self->{authz} = shift() if ( @_ );
+    return $self->{authz};
+}
+1;
+
+package FakeAuthz;
+sub new { 
+    my $class = shift();
+    return( bless( { }, $class ) );
+}
+sub hasPermissions {
+    return 1;
+}
+1;

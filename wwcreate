@@ -1,0 +1,185 @@
+#!/usr/bin/env perl
+
+
+###################################################################
+#
+# wwcreate
+#
+# by Dan Nichols (daniel.g.nichols@gmail.com), August 2016
+#
+# This script takes the following arguments:
+# 	[ optional ] a SPIRE .csv file (string, e.g. courses.csv)
+#
+# The .csv file must be a formatted SPIRE courselist file listing
+# the courses to be created on the WeBWorK server. If none is given,
+# the script will search the current directory and present a menu
+# of .csv files found for the user to choose one.
+#
+# The default adminClasslist.lst will be used unless the user supplies
+# an alternative. This must be a formatted WeBWorK classlist file
+# listing the administrator. This is necessary in order to add the
+# admin to each course).
+#
+# This script creates each course specified in the .csv file and
+# adds the appropriate instructor for each course. The courses are
+# named according to the pattern
+# semester_subject_coursenumber_section, e.g. F14_MATH_235_3.
+#
+# Each instructor's username is just their SPIRE display name with
+# spaces removed, so usually FirstLast (e.g. DanielNichols). Their
+# passwords are 'changethis', which should obviously be changed
+# immediately.
+# 
+# At the moment there is an issue with permissions; courses created
+# with this script cannot be deleted through the web interface
+# because some of their files and folders are owned by the admin
+# user who runs this script rather than www-something. However, you
+# can delete courses by running webwork's 'delcourse' command from
+# the command line and then using rm -rf to clean up the remaining
+# files. If anyone knows how to fix this, please let me know...
+# 
+# 
+###################################################################
+
+
+
+use strict;
+use warnings;
+
+use Text::CSV_XS qw( csv );
+
+# make sure these are set correctly for your webwork server
+my $webworkDir = "/opt/webwork";
+my $webworkCoursesDir = "$webworkDir/courses";
+my $problemLibraryDir = "$webworkDir/libraries/webwork-open-problem-library/OpenProblemLibrary";
+my $adminClasslistFilename = "$webworkCoursesDir/adminClasslist.lst";
+
+# initialize salt characters for crypt function
+my @saltChars = (".", "/", 0..9, "a".."z", "A".."Z");
+my $defaultPassword = "changethis";
+
+# initialize term code interpretation
+# a SPIRE term code is a 3-digit number representing the year (-1900)
+# followed by a digit representing the semester. See the following hash
+my %termToSemester = ( 1 => 'W', 3 => 'S', 5 => 'SUM', 7 => 'F' );
+
+
+
+# command line arguments: courses2.pl <batch file describing courses to create>
+# argument is optional. if it is not given, check the current directory for .csv files and
+# offer the user a choice
+my( $spireFilename ) = @ARGV;
+
+if( $spireFilename ) {
+	die "improper SPIRE .csv file in command line argument\n"
+		unless -f $spireFilename && $spireFilename =~ m/\.csv$/;
+}
+else {
+	print "No SPIRE .csv file supplied in command line argument.\n";
+
+	# make a list of all the .csv files in the source class templates directory
+	opendir my $thisDir, "." or die "Can't open directory .\n";
+	my @csvFiles = sort grep { -f $_ && $_ =~ m/\.csv$/ } readdir $thisDir;
+	closedir $thisDir;
+
+	die "No .csv files found in current directory.\n" unless @csvFiles;
+
+	print "The following .csv files were found in the current directory.\n\n";
+	print "[$_] $csvFiles[ $_ ]\n" foreach ( 0 .. @csvFiles - 1 );
+	print "\nChoose one to load, or press return to quit: ";
+
+	chomp( my $userInput = <STDIN> );
+	die "exiting\n"
+		unless $userInput =~ m/^\d+$/ && $userInput >= 0 && $userInput < @csvFiles;
+
+	$spireFilename = $csvFiles[ $userInput ];
+
+}
+
+
+# check existence of adminClasslistFilename, give user opportunity to choose a different one
+if( -f $adminClasslistFilename ) {
+	print "by default, using $adminClasslistFilename as admin classlist file.\nPress return to continue, or input a different filename: ";
+	chomp( my $userInput = <STDIN> );
+	if( $userInput ) {
+		die "invalid admin classlist file\n"
+			unless -f $userInput && $userInput =~ m/\.lst$/;
+
+		$adminClasslistFilename = $userInput;
+	}
+}
+else {
+	print "Default admin classlist file $adminClasslistFilename not found.\nInput an admin classlist file path: ";
+	chomp( my $userInput = <STDIN> );
+	die "invalid admin classlist file\n"
+		unless $userInput && -f $userInput && $userInput =~ m/\.lst$/;
+	$adminClasslistFilename = $userInput;
+}
+
+
+
+# open csv file
+open my $spireFile, '<', $spireFilename or die "\n\ncan't open $spireFilename\n";
+
+my $csv = Text::CSV_XS->new ({ keep_meta_info => 1, binary => 1 });
+$csv->header( $spireFile ); # load column names from header row
+
+# we expect to find the following columns:
+# term (semester, e.g. 1147)
+# sub (subject, e.g. MATH)
+# cat (course code, e.g. 235)
+# sec (section, e.g. 01)
+# instructor (e.g. Daniel Nichols)
+# and others we don't care about, including cl nbr, enrl cap, mtg time, ...
+
+#{$, = ", "; print "found the following columns: "; print $csv->column_names;}
+
+while( my $row = $csv->getline_hr( $spireFile ) ) {
+
+	my( $termCode, $subject, $courseCode, $instructorName )
+		= @$row{ qw( term sub cat instructor ) };
+	
+	# section column may be labeled "sec" or "sect" depending on SPIRE version
+	my $section;
+	$section = $$row{ "sec" } if exists $$row{ "sec" };
+	$section = $$row{ "sect" };
+		
+	
+	next if !( $termCode and $subject and $courseCode and $section and $instructorName );
+
+	print "term $termCode, subject $subject, code $courseCode, section $section, instructor $instructorName\n";
+
+
+	# determine semester. If term code isn't a 4-digit number, skip to the next line
+	$termCode =~ m/^(\d{3})(\d{1})$/ or next;
+	next if !defined $termToSemester{ $2 };
+	my $semester = $termToSemester{ $2 } . ( $1 - 100 );
+
+	my( $firstName, $lastName ) = ( $instructorName =~ m/(\w+)\s+(.+)/ ); # firstName is whatever comes before the first space
+	$instructorName =~ s/\s+//g;	#remove spaces to create Login name
+
+	# create classlist file containing the instructor
+	my $classlistFilename = "TEMP-Classlist-$instructorName.lst";
+
+	system( "cp $adminClasslistFilename $classlistFilename" );		# make a copy of the admin classlist
+	open my $classlistFile, '>>', $classlistFilename or die "can't open $classlistFilename\n";
+
+	# create password hash digest and write new instructor to file
+	my $defaultPasswordCrypt = crypt( $defaultPassword, join( "", @saltChars[ rand 64, rand 64 ] ) );
+	print $classlistFile ",$lastName,$firstName,,,,,,$instructorName,$defaultPasswordCrypt,10\n";
+	close $classlistFile;
+
+
+	my $courseID = "$semester\_$subject\_$courseCode\_$section";
+	#print "addcourse $courseID --users=$classlistFilename\n";
+	system( "addcourse $courseID --users=$classlistFilename > /dev/null" );
+	print "created course $courseID for instructor $instructorName\n";
+
+	symlink( $problemLibraryDir, "$webworkCoursesDir/$courseID/templates/Library" )
+		or print "\twarning: couldn't create symbolic link to the problem library for this course. Do this manually!\n";
+
+	unlink $classlistFilename;
+
+}
+
+close $spireFile;

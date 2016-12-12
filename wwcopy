@@ -1,0 +1,304 @@
+#!/usr/bin/env perl
+
+
+###################################################################
+#
+# wwcopy
+# by Dan Nichols (daniel.g.nichols@gmail.com), July 2014
+# tested on WebWork 2.7
+# 
+# this script offers the user a text menu where they can quickly 
+# copy .def files from one WeBWorK course to other courses and 
+# import the .def files to create homework assignments.
+#
+# Intended use: create multiple sections of a course and set up a
+# 'default' set of homework sets in one section. Make sure there
+# are up-to-date .def files for these assignments in that section's
+# directory. Then run this script to copy the assignments from that
+# section to all of the other ones. This is easier than setting up
+# the assignments separately in each course
+#
+# inspiration and some code borrowed from Gavin LaRose's wwmanage
+# (http://webwork.maa.org/wiki/WwManage)
+#
+###################################################################
+
+
+
+my $wwHome = '/opt/webwork/webwork2';
+my $wwCourseDir = "/opt/webwork/courses";
+
+BEGIN {
+
+	# set environment variables to allow use of WeBWorK scripts
+	#$ENV{WEBWORK_ROOT} = $wwHome;
+	$ENV{MOD_PERL_API_VERSION} = 2;
+
+}
+
+use strict;
+use warnings;
+
+use lib '/opt/webwork/pg/lib';
+use lib '/opt/webwork/webwork2/lib';
+
+use WeBWorK::PG::ImageGenerator;
+use WeBWorK::CourseEnvironment;
+use WeBWorK::DB;
+use WeBWorK::DB::Record::User;
+use WeBWorK::DB::Record::Password;
+use WeBWorK::DB::Record::PermissionLevel;
+use WeBWorK::ContentGenerator;              # get these to get set importing
+use WeBWorK::ContentGenerator::Instructor;  #   functions
+use WeBWorK::ContentGenerator::Instructor::ProblemSetList;
+use WeBWorK::Utils::CourseManagement;
+
+
+sub getClasses
+{
+	my $crsNum = shift();
+	# pre:  $crsNum is an optional input to restrict the list of classes
+	#       generated to only classes with that course number
+	# post: a reference to hash of classes defined in the system is returned:
+	#       $hash{ crsName } = [ crs#, sxn# ]
+	
+    my %cl = ();
+    my $error;
+	
+    $crsNum = 'any' if ( ! defined( $crsNum ) or !$crsNum );
+	
+	# generate a list of courses by looking in the course directory in 
+	# the webwork install
+	my @courses = `/bin/ls -dF $wwCourseDir/*`;	# read contents of directory
+	foreach my $courseName ( @courses )
+	{
+		chomp($courseName);
+		next if ( $courseName !~ /\/$/ || $courseName =~ /CVS/ ); # skip if not a folder
+		next if ( $courseName =~ m/admin\/$/ || $courseName =~ m/modelCourse\/$/ );
+		
+		$courseName =~ s/.*\/([^\/]+)\/$/$1/;	# replace absolute path with relative path
+		my( $subject, $courseNumber, $section );
+		if ( $courseName =~ /^\w+_(MATH|STAT)_(\d{3}[A-Za-z]{0,3})_(\S+)$/i )
+		{
+			$subject = $1;
+			$courseNumber = $2;
+			$section = $3;
+		}
+		elsif ( $courseName =~ /^\w+_(MATH|STAT)_(\d{3}[A-Za-z]{0,3})$/i )
+		{
+			$subject = $1;
+			$courseNumber = $2;
+			$section = 'all';
+		}
+		else
+		{ 
+			$subject = "";
+			$courseNumber = $courseName;
+			$section = '001';
+		}
+		# save the class information if it has the correct course
+		# number
+		$cl{ $courseName } = [ $subject, $courseNumber, $section ] if ( $crsNum eq 'any' || $courseNumber eq $crsNum );
+	}
+	
+	return %cl;
+}
+
+sub getList {
+    my ($str, $top, $exclude) = @_;
+    my @items = split(/,\s*/, $str);
+    my @list = ();
+    foreach ( @items ) {
+	 if ( $_ !~ /(\d+)|(\d+-\d+)/ ) {
+	     print "  error in specified list!\n";
+	 } elsif ( /-/ ) {
+	     my ($min,$max) = split(/-/,$_);
+	     if ( $min > $max || $min < 0 || $max >= $top ) {
+		 print "  class number out of range!\n";
+		 @list = ();
+		 last;
+	     } else {
+		 for ( my $i=$min; $i<=$max; $i++ ) {
+		     push(@list, $i) unless $i eq $exclude;
+		 }
+	     }
+	 } else {
+	     if ( $_ < 0 || $_ >= $top ) {
+		 print "  class number out of range!\n";
+		 @list = ();
+		 last;
+	     } elsif( $_ ne $exclude ) {
+		     push(@list, $_);
+	     }
+	 }
+    }
+    return @list;
+}
+
+
+
+
+
+print
+"\n\n\n**********************************************************************\n",
+"wwcopy\n",
+"**********************************************************************\n\n",
+"First, let's list the courses so you can choose where to copy.\n",
+"Enter a course number (e.g. 131, 233H), or leave blank to search all courses: ";
+chomp( my $courseNumber = <STDIN> );
+
+# find all sections matching given course number
+my %classlist = getClasses($courseNumber);
+my @classes = sort keys %classlist;
+
+die "Not enough matching classes found\n" unless @classes >= 2;
+
+print "Found the following classes:\n";
+for( 0 .. @classes - 1 )
+{
+	print "\t\[$_\] $classes[ $_ ]\n";
+}
+
+print "\nChoose a source class. Enter the number in brackets next to it: ";
+chomp( my $sourceClassLabel = <STDIN> );
+die if $sourceClassLabel !~ m/^\d+$/ or $sourceClassLabel < 0 or $sourceClassLabel >= @classes;
+my $sourceClass = $classes[ $sourceClassLabel ];
+
+print "You chose $sourceClass.\n\n";
+
+print "Now choose the classes to which you want to copy templates and import some .def files.\n";
+print "Enter the numbers like this: 0,3,6-8 or enter 'all'. The source class will be ignored.\n";
+print "Target classes: ";
+
+chomp( my $targetClassesString = <STDIN> );
+my @targetClasses;
+if( $targetClassesString =~ m/^all$/ix )
+{
+	$targetClassesString = "0-" . ( -1 + scalar @classes );
+}
+@targetClasses = map{ $classes[ $_ ] } getList( $targetClassesString, scalar @classes, $sourceClassLabel );
+
+
+die "You must choose at least one target class\n" if !@targetClasses;
+
+print "\nOK, let's copy /templates from $sourceClass to the following classes:\n";
+print "\t$_\n" foreach @targetClasses;
+
+
+
+
+# move to source class templates directory
+my $sourceClassTemplates = "$wwCourseDir/$sourceClass/templates";
+chdir $sourceClassTemplates;
+
+# make a list of all the .def files in the source class templates directory
+opendir my $sourceClassDir, "." or die "Can't open directory $sourceClassTemplates\n";
+my @defFiles = sort grep { -f $_ && $_ =~ m/\.def$/ } readdir $sourceClassDir;
+closedir $sourceClassDir;
+
+die "No .def files found in $sourceClass/templates\n" if !@defFiles;
+
+# list .def files and ask user which to import
+print "\nThe entire /templates folder will be copied from the source class to\n";
+print "each target class. You can choose which .def files will be imported to\n";
+print "create assignments.\n\n";
+print "Here are the .def files in $sourceClass/templates :\n";
+for( 0 .. @defFiles - 1 )
+{
+	print "\t\[$_\] $defFiles[ $_ ]\n";
+}
+print "Choose the files you want to import:\n";
+print "Enter the numbers like this: 0,3,6-8 or enter 'all'\n";
+print "files to import: ";
+
+chomp( my $defFilesChosenString = <STDIN> );
+my @defFilesChosen;
+if( $defFilesChosenString =~ m/^all$/ix )
+{
+	@defFilesChosen = @defFiles;
+}
+else
+{
+	@defFilesChosen = sort map{ $defFiles[ $_ ] } getList( $defFilesChosenString, scalar @defFiles, "" );
+}
+
+die "you must choose at least one .def file\n" if !@defFilesChosen;
+
+print "\nOK, let's import the following .def files from $sourceClass after copying:\n";
+print "\t$_\n" foreach @defFilesChosen;
+
+# final confirmation
+print "WARNING: old files in /templates in target courses may be overwritten!\n";
+print "Ready to copy and import these files? y/n: ";
+chomp( my $confirm = <STDIN> );
+
+die "OK, quitting\n" if $confirm =~ m/^n$/ix;
+
+print "\n";
+
+# now do each destination class
+foreach my $thisClass ( @targetClasses )
+{
+	print "$thisClass: ";
+	
+	# copy .def files from source Class
+	system( "/bin/cp -rd $wwCourseDir/$sourceClass/templates/* $wwCourseDir/$thisClass/templates" );
+	print "copied /templates files... ";
+
+	# create database object
+	my $csce = WeBWorK::CourseEnvironment->new( { webwork_dir => $wwHome, courseName => $thisClass } );
+	my $db = WeBWorK::DB->new( $csce->{dbLayout} );
+	
+	# build a fake request object so that we can get an instructor::problemsetlist object
+	my $fr = FakeRequest->new();
+	$fr->ce( $csce );
+	$fr->db( $db );
+	my $wwInstrPSL = WeBWorK::ContentGenerator::Instructor::ProblemSetList->new($fr);
+	
+	# import the sets
+	$wwInstrPSL->importSetsFromDef( "", 'all', @defFilesChosen );
+	print "imported chosen .def files.\n";
+
+}
+
+print "\nfinished!\n";
+
+
+#-------------------------------------------------------------------------------
+# fake WeBWorK packages that we don't want to build en envmasse in order to 
+# get access to the importSetFromDef routine in ProblemSetList.pm
+#
+
+package FakeRequest;
+sub new {
+    my $class = shift();
+    my $authz = new FakeAuthz;
+    return( bless( { ce => , db => , authz => $authz }, $class ) );
+}
+sub ce {
+    my $self = shift();
+    $self->{ce} = shift() if ( @_ );
+    return $self->{ce};
+}
+sub db {
+    my $self = shift();
+    $self->{db} = shift() if ( @_ );
+    return $self->{db};
+}
+sub authz {
+    my $self = shift();
+    $self->{authz} = shift() if ( @_ );
+    return $self->{authz};
+}
+1;
+
+package FakeAuthz;
+sub new { 
+    my $class = shift();
+    return( bless( { }, $class ) );
+}
+sub hasPermissions {
+    return 1;
+}
+1;
+=cut
